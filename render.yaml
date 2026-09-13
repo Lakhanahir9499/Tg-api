@@ -7,3 +7,5 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: HF_TOKEN
+        sync: false   # Render dashboard me manually apna Hugging Face token daalo
