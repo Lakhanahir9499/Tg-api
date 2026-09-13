@@ -1,57 +1,72 @@
 import duckdb
 import os
 import threading
-import urllib.request
-import json
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 # ── Config ─────────────────────────────────────────────────────────────────
 DATASET_REPO = "sunsau91/my-fast-telegram-data"
-HF_PARQUET_API = f"https://huggingface.co/api/datasets/{DATASET_REPO}/parquet"
 
-def fetch_parquet_files():
-    """
-    Dataset ke andar actual kitni parquet files hain aur unke exact URLs kya
-    hain, ye hardcode karne ke bajaye HF ke official parquet API se runtime
-    pe nikalte hain. Shard count/naming badal bhi jaye (jaisa isse pehle
-    0000.parquet se badal ke 0.parquet ho gaya tha), ye khud-ba-khud
-    current files use karega.
-    """
-    with urllib.request.urlopen(HF_PARQUET_API, timeout=30) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+# Render dashboard me "HF_TOKEN" env var set karo (huggingface.co/settings/tokens
+# se free "Read" token bana lo). Bina token ke HF anonymous requests ko bahut
+# jaldi 429 (rate limit) de deta hai.
+HF_TOKEN = os.environ.get("HF_TOKEN", "")
 
-    urls = []
-    for split_files in data.values():       # e.g. {"default": {"train": [...]}}
-        for file_list in split_files.values():
-            urls.extend(file_list)
-
-    if not urls:
-        raise RuntimeError(
-            f"HF parquet API se koi file nahi mili: {HF_PARQUET_API}"
-        )
-    return urls
-
-# ── Thread-local DuckDB connections ────────────────────────────────────────
+# ── Shared DuckDB connection + per-thread cursor ───────────────────────────
+# Ek hi base connection banate hain (jisme HF secret aur view sirf ek baar
+# setup hoti hai), aur har thread ko uska apna cursor(). Isse:
+#   - parquet metadata/footer baar baar alag-alag connections se fetch nahi
+#     hota (object cache + http metadata cache shared rehta hai)
+#   - HF ko lagne wale requests ki total count kaafi kam ho jaati hai
+_base_con = None
+_base_lock = threading.Lock()
 _local = threading.local()
 
-def get_con():
-    if not hasattr(_local, "con"):
+def _init_base_con():
+    global _base_con
+    if _base_con is not None:
+        return _base_con
+    with _base_lock:
+        if _base_con is not None:
+            return _base_con
+
         con = duckdb.connect()
         con.execute("INSTALL httpfs; LOAD httpfs;")
         con.execute("INSTALL parquet; LOAD parquet;")
-        # Performance settings
+
+        # Caching: same file ka metadata/data baar baar fetch na ho
+        con.execute("PRAGMA enable_object_cache;")
+        con.execute("SET enable_http_metadata_cache=true;")
         con.execute("SET threads = 4;")
         con.execute("SET memory_limit = '512MB';")
 
-        parquet_files = fetch_parquet_files()
-        files = ", ".join(f"'{u}'" for u in parquet_files)
+        if HF_TOKEN:
+            con.execute(f"""
+                CREATE OR REPLACE SECRET hf_token (
+                    TYPE huggingface,
+                    TOKEN '{HF_TOKEN}'
+                );
+            """)
+
+        # DuckDB ka native hf:// scheme khud dataset ke andar actual parquet
+        # files resolve karta hai (jaisa naming/shard count ho) — hume koi
+        # URL ya API call manually banane/handle karne ki zaroorat nahi.
         con.execute(f"""
             CREATE OR REPLACE VIEW tg AS
-            SELECT * FROM read_parquet([{files}], union_by_name=true, hive_partitioning=false)
+            SELECT * FROM read_parquet(
+                'hf://datasets/{DATASET_REPO}/**/*.parquet',
+                union_by_name=true,
+                hive_partitioning=false
+            )
         """)
-        _local.con = con
+        _base_con = con
+        return _base_con
+
+def get_con():
+    if not hasattr(_local, "con"):
+        base = _init_base_con()
+        _local.con = base.cursor()
     return _local.con
 
 # ── FastAPI ────────────────────────────────────────────────────────────────
@@ -81,9 +96,14 @@ def health():
 
 @app.get("/debug/files")
 def debug_files():
-    """Verify karne ke liye ki actual mein kaun se parquet files load ho rahe hain."""
+    """Sirf ye check karta hai ki dataset ke andar kaun se parquet files match ho rahe
+    hain (halka glob listing hai, poora data scan nahi karta)."""
     try:
-        files = fetch_parquet_files()
+        con = get_con()
+        rows = con.execute(f"""
+            SELECT file FROM glob('hf://datasets/{DATASET_REPO}/**/*.parquet')
+        """).fetchall()
+        files = [r[0] for r in rows]
         return {"count": len(files), "files": files}
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
