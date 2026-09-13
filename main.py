@@ -1,19 +1,37 @@
 import duckdb
 import os
 import threading
+import urllib.request
+import json
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 # ── Config ─────────────────────────────────────────────────────────────────
-HF_BASE = "https://huggingface.co/datasets/sunsau91/my-fast-telegram-data/resolve/refs%2Fconvert%2Fparquet/default/train"
+DATASET_REPO = "sunsau91/my-fast-telegram-data"
+HF_PARQUET_API = f"https://huggingface.co/api/datasets/{DATASET_REPO}/parquet"
 
-# Dataset mein kitne parquet files hain check karne ke liye:
-# curl https://huggingface.co/api/datasets/sunsau91/my-fast-telegram-data/parquet
-# Filhaal 0000 se 0019 tak try kar rahe hain (adjust karna ho sakta hai)
-PARQUET_FILES = [
-    f"{HF_BASE}/{str(i).zfill(4)}.parquet" for i in range(20)
-]
+def fetch_parquet_files():
+    """
+    Dataset ke andar actual kitni parquet files hain aur unke exact URLs kya
+    hain, ye hardcode karne ke bajaye HF ke official parquet API se runtime
+    pe nikalte hain. Shard count/naming badal bhi jaye (jaisa isse pehle
+    0000.parquet se badal ke 0.parquet ho gaya tha), ye khud-ba-khud
+    current files use karega.
+    """
+    with urllib.request.urlopen(HF_PARQUET_API, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    urls = []
+    for split_files in data.values():       # e.g. {"default": {"train": [...]}}
+        for file_list in split_files.values():
+            urls.extend(file_list)
+
+    if not urls:
+        raise RuntimeError(
+            f"HF parquet API se koi file nahi mili: {HF_PARQUET_API}"
+        )
+    return urls
 
 # ── Thread-local DuckDB connections ────────────────────────────────────────
 _local = threading.local()
@@ -26,7 +44,9 @@ def get_con():
         # Performance settings
         con.execute("SET threads = 4;")
         con.execute("SET memory_limit = '512MB';")
-        files = ", ".join(f"'{u}'" for u in PARQUET_FILES)
+
+        parquet_files = fetch_parquet_files()
+        files = ", ".join(f"'{u}'" for u in parquet_files)
         con.execute(f"""
             CREATE OR REPLACE VIEW tg AS
             SELECT * FROM read_parquet([{files}], union_by_name=true, hive_partitioning=false)
@@ -58,6 +78,15 @@ def root():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/debug/files")
+def debug_files():
+    """Verify karne ke liye ki actual mein kaun se parquet files load ho rahe hain."""
+    try:
+        files = fetch_parquet_files()
+        return {"count": len(files), "files": files}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/search")
 def search(
